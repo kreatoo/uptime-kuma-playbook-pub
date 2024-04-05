@@ -1,0 +1,324 @@
+- name: Add AWX Hosts, vHosts inside them, and notifications to Uptime Kuma
+  hosts: localhost
+  connection: local
+  vars:
+    awx_api_url: https://test
+    awx_pass: awx_pass
+    awx_user: admin
+    uk_api_username: admin
+    uk_api_password: ux_api_pass 
+    uk_api_url: http://localhost:3001 
+    zulip_url: http://localhost
+    alarm_stream: alarm
+    target_group_postgres: role_postgres
+    target_group_postgres_port: "5432"
+    target_group_postgres_user: "postgres"
+    target_group_postgres_password: ""
+    target_group_postgres_database: "postgres"
+    target_group_mysql: role_mysql
+    target_group_mysql_port: "3306"
+    target_group_mysql_user: "mysql"
+    target_group_mysql_password: ""
+    target_group_mysql_database: "mysql"
+
+  tasks:
+    - name: Get hosts from AWX API
+      uri:
+        url: "{{ awx_api_url }}/api/v2/hosts"
+        method: GET
+        validate_certs: yes
+        return_content: yes
+        user: "{{ awx_user }}"
+        password: "{{ awx_pass }}"
+        force_basic_auth: yes
+        status_code: 200
+      register: resawx
+  
+    - name: Parse the AWX API response to get host names
+      set_fact:
+        awx_hosts: "{{ resawx | moreati.jq.jq('[.json.results[] | { name: .name, groups: (if .summary_fields.groups.results then [.summary_fields.groups.results[].name] else [] end) } | tostring] | join(\",\")') }}"
+   
+    - name: Login Uptime Kuma with credentials once and register the result
+      lucasheld.uptime_kuma.login:
+        api_url: "{{ uk_api_url }}"
+        api_username: "{{ uk_api_username }}"
+        api_password: "{{ uk_api_password }}"
+      register: result
+
+    - name: Get token from previous job and set it as fact
+      set_fact:
+        uk_api_token: "{{ result.token }}"
+
+    - name: Get vHosts (Apache)
+      shell: |
+        grep -Ih '^ServerName' /usr/local/apache/conf/virtual.conf /usr/local/apache*/etc/sites-available/*.conf /etc/apache*/sites-available/*.conf /etc/httpd/conf/*.conf /etc/httpd/conf.d/*.conf | awk '{print $2}'
+      register: apache_hosts
+      changed_when: false
+      delegate_to: "{{ item.name }}"
+      loop: "{{ awx_hosts }}"
+
+    - name: Find nginx configuration files and get their output
+      shell: |
+          for file in $(find /etc/nginx* -name '*.conf' -o -path '/etc/nginx*/conf.d/*.conf' -o -path '/usr/local/nginx*/conf/*.conf'); do
+            cat "$file"
+          done
+      register: nginx_configs
+      delegate_to: "{{ item.name }}"
+      changed_when: false
+      loop: "{{ awx_hosts }}"
+
+    - name: Get vHosts (NGINX) 
+      set_fact:
+        nginx_hosts: "{{ nginx_configs.stdout_lines | select('search', '^\\s*server_name\\s') | map('regex_replace', '^\\s*server_name\\s+', '') | map('regex_replace', ';$', '') | map('regex_replace', '^(\\S+).*$', '\\1') | map('regex_replace', '^_$', '') | select('!=', '') | map('trim') | list }}"
+
+    - name: Get vHosts (Caddy)
+      maxhoesel.caddy.caddy_config_info:
+        path: apps/http/servers
+        caddy_host: "http://localhost:2019"
+      delegate_to: "{{ item.name }}"
+      register: servers
+      loop: "{{ awx_hosts }}"
+      ignore_errors: True 
+
+    - name: Set caddy_srvs fact (Caddy)
+      set_fact: 
+        caddy_srvs: "{{ servers.config | moreati.jq.jq('.[].routes') | list }}"
+      when: servers.config is defined
+  
+    - name: Initialize caddy_hosts fact (Caddy)
+      set_fact:
+        caddy_hosts: []
+      when: caddy_srvs is defined
+
+    - name: Set caddy_hosts fact (Caddy)
+      set_fact:
+        caddy_hosts: "{{ caddy_hosts + item | moreati.jq.jq('.match.[].host')  }}"
+      loop: "{{ caddy_srvs }}"
+      when: caddy_hosts is defined and caddy_srvs is defined
+    
+    - name: Initialize target_group_postgres_hosts fact
+      set_fact:
+        target_group_postgres_hosts: []
+    
+    - name: "Add hosts that have tag '{{ target_group_postgres }}' to target_group_postgres_hosts fact"
+      set_fact:
+        target_group_postgres_hosts: "{{ target_group_postgres_hosts + [item.name] }}"
+      loop: "{{ awx_hosts | selectattr('groups', 'defined') | selectattr('groups', '!=', []) | selectattr('groups', 'contains', target_group_postgres) }}"
+      ignore_errors: True
+    
+    - name: Initialize target_group_mysql_hosts fact
+      set_fact:
+        target_group_mysql_hosts: []
+
+    - name: "Add hosts that have tag '{{ target_group_mysql }}' to target_group_mysql_hosts fact"
+      set_fact:
+        target_group_postgres_hosts: "{{ target_group_mysql_hosts + [item.name] }}"
+      loop: "{{ awx_hosts | selectattr('groups', 'defined') | selectattr('groups', '!=', []) | selectattr('groups', 'contains', target_group_mysql) }}"
+      ignore_errors: True
+      
+    - name: Get all monitors that already exist
+      lucasheld.uptime_kuma.monitor_info:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+      register: resmonitors
+
+    - name: Set fact of all monitors that exist
+      set_fact:
+        all_monitors: "{{ resmonitors.monitors | map(attribute='name') }}"
+    
+    - name: Add notifications
+      lucasheld.uptime_kuma.notification:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: slack
+        isDefault: false
+        slackwebhookURL: "{{ zulip_url }}&stream={{ alarm_stream | default('alarm') }}&topic={{ item }}"
+        applyExisting: false
+        state: present
+      loop: "{{ awx_hosts | map(attribute='name') | difference(all_monitors) }}"
+    
+    - name: Add notifications (Caddy)
+      lucasheld.uptime_kuma.notification:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: slack
+        isDefault: false
+        slackwebhookURL: "{{ zulip_url }}&stream={{ alarm_stream | default('alarm') }}&topic={{ item }}"
+        applyExisting: false
+        state: present
+      loop: "{{ caddy_hosts | difference(all_monitors) }}"
+      when: caddy_hosts is defined
+
+    - name: Add notifications (NGINX)
+      lucasheld.uptime_kuma.notification:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: slack
+        isDefault: false
+        slackwebhookURL: "{{ zulip_url }}&stream={{ alarm_stream | default('alarm') }}&topic={{ item }} }}"
+        applyExisting: false
+        state: present
+      loop: "{{ nginx_hosts | difference(all_monitors) }}"
+      when: nginx_hosts is defined
+
+    - name: Add notifications (Apache)
+      lucasheld.uptime_kuma.notification:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: slack
+        isDefault: false
+        slackwebhookURL: "{{ zulip_url }}&stream={{ alarm_stream | default('alarm') }}&topic={{ item }} }}"
+        applyExisting: false
+        state: present
+      loop: "{{ apache_hosts.stdout_lines | difference(all_monitors) }}"
+      when: apache_hosts is defined and apache_hosts.stdout_lines != []
+    
+    - name: Add notifications (Postgres)
+      lucasheld.uptime_kuma.notification:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}-postgres"
+        type: slack
+        isDefault: false
+        slackwebhookURL: "{{ zulip_url }}&stream={{ alarm_stream | default('alarm') }}&topic={{ item }}-postgres"
+        applyExisting: false
+        state: present
+      loop: "{{ target_group_postgres_hosts | difference(all_monitors) }}"
+      when: "target_group_postgres_hosts != []"
+    
+    - name: Add notifications (MySQL)
+      lucasheld.uptime_kuma.notification:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}-mysql"
+        type: slack
+        isDefault: false
+        slackwebhookURL: "{{ zulip_url }}&stream={{ alarm_stream | default('alarm') }}&topic={{ item }}-mysql"
+        applyExisting: false
+        state: present
+      loop: "{{ target_group_mysql_hosts | difference(all_monitors) }}"
+      when: "target_group_mysql_hosts != []"
+
+    - name: Add hosts to Uptime Kuma
+      lucasheld.uptime_kuma.monitor:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: http
+        url: "https://{{ item }}"
+        state: present
+        notification_names: "{{ item }}"
+        expiryNotification: yes
+      loop: "{{ awx_hosts | map(attribute='name') | difference(all_monitors) }}"
+
+    - name: Add hosts to Uptime Kuma (Caddy)
+      lucasheld.uptime_kuma.monitor:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: http
+        url: "https://{{ item }}"
+        state: present
+        notification_names: "{{ item }}"
+        expiryNotification: yes
+      loop: "{{ caddy_hosts | difference(all_monitors) }}"
+      when: caddy_hosts is defined
+    
+    - name: Add hosts to Uptime Kuma (NGINX)
+      lucasheld.uptime_kuma.monitor:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: http
+        url: "https://{{ item }}"
+        state: present
+        notification_names: "{{ item }}"
+        expiryNotification: yes
+      loop: "{{ nginx_hosts | difference(all_monitors) }}"
+      when: nginx_hosts is defined
+
+    - name: Add hosts to Uptime Kuma (Apache)
+      lucasheld.uptime_kuma.monitor:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        type: http
+        url: "https://{{ item }}"
+        state: present
+        notification_names: "{{ item }}"
+        expiryNotification: yes
+      loop: "{{ apache_hosts.stdout_lines | difference(all_monitors) }}"
+      when: apache_hosts is defined and apache_hosts.stdout_lines != []
+    
+    - name: Give warning if target_group_postgres_password is empty
+      ignore_errors: True
+      fail:
+        msg: "target_group_postgres_password is empty. This playbook is made with the use of password in mind, so Postgres Uptime Kuma monitors may not work." 
+      when: target_group_postgres_password == "" and target_group_postgres_hosts != []
+    
+    - name: Give warning if target_group_mysql_password is empty
+      ignore_errors: True
+      fail:
+        msg: "target_group_mysql_password is empty. This playbook is made with the use of password in mind, so MySQL Uptime Kuma monitors may not work." 
+      when: target_group_mysql_password == "" and target_group_mysql_hosts != []
+
+    - name: Add hosts to Uptime Kuma (Postgres)
+      lucasheld.uptime_kuma.monitor:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}-postgres"
+        type: postgres
+        databaseConnectionString: "postgres://{{ target_group_postgres_user }}:{{ target_group_postgres_password }}@{{ item }}:{{ target_group_postgres_port }}/{{ target_group_postgres_database }}"
+        databaseQuery: "SELECT NOW();"
+        state: present
+        notification_names: "{{ item }}-postgres"
+        expiryNotification: yes
+      loop: "{{ target_group_postgres_hosts | difference(all_monitors) }}"
+      when: "target_group_postgres_hosts != []"
+
+    - name: Add hosts to Uptime Kuma (MySQL)
+      lucasheld.uptime_kuma.monitor:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}-mysql"
+        type: postgres
+        databaseConnectionString: "mysql://{{ target_group_mysql_user }}:{{ target_group_mysql_password }}@{{ item }}:{{ target_group_mysql_port }}/{{ target_group_mysql_database }}"
+        databaseQuery: "SELECT CURRENT_TIMESTAMP;"
+        state: present
+        notification_names: "{{ item }}-mysql"
+        expiryNotification: yes
+      loop: "{{ target_group_mysql_hosts | difference(all_monitors) }}"
+      when: "target_group_mysql_hosts != []"
+
+    - name: Get all tags that already exist
+      lucasheld.uptime_kuma.tag_info:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+      register: result_tags
+
+    - name: Set fact of all monitors that exist
+      set_fact:
+        all_tags: "{{ result_tags.tags | map(attribute='name') }}"
+    
+    - name: Add tag
+      lucasheld.uptime_kuma.tag:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        name: "{{ item }}"
+        color: "#000000"
+      loop: "{{ awx_hosts | map(attribute='groups') | flatten | unique | difference(all_tags) }}"
+    
+    - name: Add monitor tags to Uptime Kuma
+      lucasheld.uptime_kuma.monitor_tag:
+        api_url: "{{ uk_api_url }}"
+        api_token: "{{ uk_api_token }}"
+        monitor_name: "{{ item.0 }}"
+        tag_name: "{{ item.1 }}"
+        state: present
+      with_subelements:
+        - "{{ awx_hosts | selectattr('groups', 'defined') | selectattr('groups', '!=', []) | map(attribute='name') | difference(all_monitors) }}"
+        - groups
